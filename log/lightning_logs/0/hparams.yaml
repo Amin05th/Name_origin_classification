@@ -1,0 +1,4 @@
+device: cuda
+hidden_size: 512
+input_size: 57
+num_classes: 18
