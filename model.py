@@ -3,64 +3,78 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader
 import pytorch_lightning as pl
+import torch.nn.init as init
 
 
 class NameClassificationModel(pl.LightningModule):
-    def __init__(self, train_dataset, val_dataset, device, input_size, hidden_size, embedding_dim, num_layers, num_classes):
+    def __init__(self, input_size, hidden_size, num_classes, device):
         super(NameClassificationModel, self).__init__()
         self.save_hyperparameters()
-        self.embed = nn.Embedding(input_size, embedding_dim)
-        self.lstm = nn.LSTM(embedding_dim, hidden_size, num_layers=num_layers, batch_first=True, bidirectional=True)
-        self.fc = nn.Linear(hidden_size, num_classes)
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True, bidirectional=True)
+        self.dropout = nn.Dropout()
+        self.fc = nn.Linear(hidden_size * 2, 256)
+        self.fc1 = nn.Linear(256, 128)
+        self.fc2 = nn.Linear(128, num_classes)
+        self.init_weights()
 
     def forward(self, x):
-        print(x)
-        exit()
-        x = self.embed(x.long())  # Convert data_ids_tensor to Long type
-        x = x.view(x.size(0), -1)
-        x, _ = self.lstm(x, self.init_hidden(x.size(0)))
-        x = self.fc(x[:, 1])
-        return x
+        hidden = self.init_hidden(x.size(0))
+        lstm_out, hidden = self.lstm(x, self.init_hidden(x.size(0)))
+        lstm_out = self.fc(lstm_out[-1])
+        lstm_out = self.dropout(lstm_out)
+        lstm_out = self.fc1(lstm_out)
+        lstm_out = self.fc2(lstm_out)
+        return lstm_out
 
     def init_hidden(self, batch):
-        h0 = torch.zeros(self.hparams.num_layers * 2, batch, self.hparams.hidden_size).to(self.hparams.device)
-        c0 = torch.zeros(self.hparams.num_layers * 2, batch, self.hparams.hidden_size).to(self.hparams.device)
-        return h0, c0
+        return (torch.zeros(2, batch, self.hparams.hidden_size).to(self.hparams.device),
+                torch.zeros(2, batch, self.hparams.hidden_size).to(self.hparams.device))
 
     def training_step(self, batch, batch_idx):
-        data_ids_tensor, language_label_encoded = batch
-        y_pred = self.forward(data_ids_tensor)
-        print(y_pred)
-        exit()
-
-    def train_dataloader(self):
-        return DataLoader(self.hparams.train_dataset, batch_size=64, num_workers=12, collate_fn=self.collate_fn)
+        tensored_country, tensored_name = batch
+        y_pred = self.forward(tensored_name.squeeze(dim=0))
+        loss = F.cross_entropy(y_pred, tensored_country[0])
+        self.log("train_loss", loss.item())
+        return loss
 
     def validation_step(self, batch, batch_idx):
-        pass
+        tensored_country, tensored_name = batch
+        y_pred = self.forward(tensored_name.squeeze(dim=0))
+        loss = F.cross_entropy(y_pred, tensored_country[0])
+        self.log("val_loss", loss.item())
+        return loss
 
-    def val_dataloader(self):
-        return DataLoader(self.hparams.val_dataset, batch_size=64, num_workers=12, collate_fn=self.collate_fn)
+    def test(self, linetotensor, all_categories):
+        self.to(self.hparams.device)
+        while True:
+            test_name = input("Enter name to get origin (type 'quit' to exit): ")
+            tensored_name = linetotensor(test_name).to(self.hparams.device)
+            target_prediction = self.forward(tensored_name)
+            _, target_prediction_idx = torch.max(target_prediction, dim=1)
+            print(all_categories[target_prediction_idx])
+            if test_name == "quit":
+                break
 
-    def test(self):
-        pass
-
-    def collate_fn(self, batch):
-        data_ids_tensor, language_label_encoded = zip(*batch)
-        data_ids_padded = pad_sequence(data_ids_tensor, batch_first=True)
-        language_label_encoded = torch.cat(language_label_encoded)
-        return data_ids_padded, language_label_encoded
+    def init_weights(self):
+        for layer in [self.fc, self.fc1]:
+            if isinstance(layer, nn.Linear):
+                init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    init.constant_(layer.bias, 0.0)
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=1e-4)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.30, patience=5, verbose=True)
+        clip_value = 0.8
+        torch.nn.utils.clip_grad_value_(self.parameters(), clip_value)
+        # scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
         return {
             'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'monitor': 'val_loss'
-            }
+            'amp_backend': 'native',
+            "amp_level": '02',
+            # 'lr_scheduler': {
+            #     'scheduler': scheduler,
+            #     'monitor': 'val_loss'
+            # }
         }
+

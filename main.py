@@ -1,100 +1,109 @@
+from io import open
+import glob
 import os
-import string
-import unicodedata
-import numpy as np
-from sklearn.preprocessing import OneHotEncoder
 import torch
-from torch.utils.data import Dataset, random_split
-from model import NameClassificationModel
-import pytorch_lightning as pl
+import unicodedata
+import string
+import random
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning import Trainer, seed_everything
+from torch.utils.data import DataLoader
+from model import NameClassificationModel
 
-# initialize cuda
+seed_everything(42)
+
+def findFiles(path): return glob.glob(path)
+
+
+
+all_letters = string.ascii_letters + " .,;'"
+n_letters = len(all_letters)
+
+
+# Turn a Unicode string to plain ASCII, thanks to https://stackoverflow.com/a/518232/2809427
+def unicodeToAscii(s):
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', s)
+        if unicodedata.category(c) != 'Mn'
+        and c in all_letters
+    )
+
+
+# Build the category_lines dictionary, a list of names per language
+category_lines = {}
+all_categories = []
+
+
+# Read a file and split into lines
+def readLines(filename):
+    lines = open(filename, encoding='utf-8').read().strip().split('\n')
+    return [unicodeToAscii(line) for line in lines]
+
+
+for filename in findFiles('data/names/*.txt'):
+    category = os.path.splitext(os.path.basename(filename))[0]
+    all_categories.append(category)
+    lines = readLines(filename)
+    category_lines[category] = lines
+
+n_categories = len(all_categories)
+fixed_sequence_length = 12
+
+
+def letterToIndex(letter):
+    return all_letters.find(letter)
+
+
+def letterToTensor(letter):
+    tensor = torch.zeros(1, n_letters)
+    tensor[0][letterToIndex(letter)] = 1
+    return tensor
+
+
+def lineToTensor(line):
+    tensor = torch.zeros(len(line), 1, n_letters)
+    for li, letter in enumerate(line):
+        tensor[li][0][letterToIndex(letter)] = 1
+    return tensor
+
+
+def categoryFromOutput(output):
+    top_n, top_i = output.topk(1)
+    category_i = top_i[0].item()
+    return all_categories[category_i], category_i
+
+
+def randomChoice(l):
+    return l[random.randint(0, len(l) - 1)]
+
+
+def randomTrainingExample():
+    category = randomChoice(all_categories)
+    line = randomChoice(category_lines[category])
+    category_tensor = torch.tensor([all_categories.index(category)], dtype=torch.long)
+    line_tensor = lineToTensor(line)
+    return category_tensor, line_tensor
+
+
+training_set = []
+val_set = []
+
+for _ in range(1000):
+    training_example = randomTrainingExample()
+    training_set.append(training_example)
+
+for _ in range(1000):
+    val_example = randomTrainingExample()
+    val_set.append(val_example)
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# load data
-def load_data():
-    names_country_dict = {}
-    names_directory = "data/names"
-    languages_file_list = os.listdir(names_directory)
-    for file in languages_file_list:
-        language = file.split(".")[0]
-        with open(f"{names_directory}/{file}", "r") as f:
-            names_country_dict[language] = f.read().splitlines()
-    return names_country_dict
-
-
-# preprocess data
-def preprocess_data():
-    row_data = load_data()
-    preprocessed_data = {}
-    letters = string.ascii_letters + ".,:'"
-
-    for country, data in row_data.items():
-        one_hot_encoded_data = []
-
-        for name in data:
-            unidecode_name = [letter for letter in name if unicodedata.normalize("NFD", letter) in letters]
-            one_hot_encoded_name = []
-
-            for letter in unidecode_name:
-                one_hot_encoded_letter = np.zeros(len(letters))
-                indexed_letter = letters.index(letter)
-                one_hot_encoded_letter[indexed_letter] = 1
-                one_hot_encoded_name.append(one_hot_encoded_letter)
-
-            one_hot_encoded_data.append(one_hot_encoded_name)
-
-        preprocessed_data[country] = one_hot_encoded_data
-
-    return preprocessed_data
-
-
-class NameOriginDataset(Dataset):
-    def __init__(self, data):
-        self.data = data
-        self.languages = list(self.data.keys())
-        self.encoder = OneHotEncoder(categories=[self.languages], sparse_output=False)
-        self.total_length = self.calculate_total_length()
-
-    def calculate_total_length(self):
-        total_length = 0
-        for language in self.languages:
-            total_length += len(self.data[language])
-        return total_length
-
-    def __getitem__(self, idx):
-        language_index = 0
-        sample_index = idx
-        while sample_index >= len(self.data[self.languages[language_index]]):
-            sample_index -= len(self.data[self.languages[language_index]])
-            language_index += 1
-        language_data = self.data[self.languages[language_index]]
-        data_ids = np.array(language_data[sample_index])
-        data_ids_tensor = torch.tensor(data_ids)
-        language_label = self.languages[language_index]
-        language_label_encoded = torch.Tensor(self.encoder.fit_transform([[language_label]]))
-
-        return data_ids_tensor, language_label_encoded
-
-    def __len__(self):
-        return self.total_length
-
-
-# created dataset and split dataset
-dataset = NameOriginDataset(preprocess_data())
-train_dataset, val_dataset = random_split(dataset, [0.8, 0.2])
-
-# create model
-model = NameClassificationModel(train_dataset, val_dataset, device, len(dataset), 3000, 100, 2, 18)
-
-# set up Tensorboard
+n_hidden = 512
+num_layers = 2
 tb_logger = TensorBoardLogger(save_dir="./log", version="0")
-
-# set up trainer for training
-trainer = pl.Trainer(max_epochs=5, log_every_n_steps=1,
-                     logger=tb_logger, precision="16-mixed")
-
-trainer.fit(model)
-model.test()
+test_lstm = NameClassificationModel(n_letters, n_hidden, n_categories, device=device)
+trainer = Trainer(max_epochs=100, logger=tb_logger, default_root_dir="./checkpoints", accumulate_grad_batches=20)
+trainer.fit(test_lstm, train_dataloaders=DataLoader(training_set, 1, num_workers=12),
+            val_dataloaders=DataLoader(val_set, 1, num_workers=12))
+trainer.save_checkpoint("./model.ckpt")
+loaded_model = NameClassificationModel.load_from_checkpoint("./model.ckpt")
+test_lstm.test(lineToTensor, all_categories)
